@@ -8,7 +8,7 @@ import time
 import tempfile
 import shutil
 import re
-import requests as http_requests  # kept for potential future HTTP-based scraping
+import requests as http_requests
 from typing import Optional
 from datetime import datetime, timedelta
 
