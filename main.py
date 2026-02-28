@@ -1,7 +1,6 @@
 """
 Listing Notifier Scraper Service
-Headless Selenium scraper for Property Control Center (land.com).
-Accepts user credentials and returns structured listing data as JSON.
+Hybrid approach: Selenium for login, then direct HTTP for data export.
 """
 
 import os
@@ -9,10 +8,13 @@ import io
 import time
 import tempfile
 import shutil
+import re
+import requests as http_requests
 from typing import Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -20,8 +22,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+import json
 
-app = FastAPI(title="Listing Notifier Scraper", version="1.0.0")
+app = FastAPI(title="Listing Notifier Scraper", version="2.0.0")
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -45,7 +48,7 @@ class LoginTestRequest(BaseModel):
 
 def verify_auth(authorization: Optional[str] = None):
     if not API_SECRET:
-        return  # No secret configured, skip auth (dev mode)
+        return
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     token = authorization.replace("Bearer ", "")
@@ -55,7 +58,7 @@ def verify_auth(authorization: Optional[str] = None):
 
 # ─── Selenium Helpers ─────────────────────────────────
 
-def create_driver(export_folder: str) -> webdriver.Chrome:
+def create_driver() -> webdriver.Chrome:
     """Create a headless Chrome WebDriver."""
     options = Options()
     options.add_argument("--headless=new")
@@ -63,32 +66,24 @@ def create_driver(export_folder: str) -> webdriver.Chrome:
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-images")
     options.add_argument(
         "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
     )
 
-    # Download directory
-    options.add_experimental_option("prefs", {
-        "download.default_directory": export_folder,
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "safebrowsing.enabled": True,
-    })
-
-    # Fresh temp profile
     temp_profile = tempfile.mkdtemp(prefix="selenium-profile-")
     options.add_argument(f"--user-data-dir={temp_profile}")
 
     driver = webdriver.Chrome(options=options)
-    driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
     return driver
 
 
-def login(driver: webdriver.Chrome, username: str, password: str) -> bool:
-    """Login to Property Control Center. Returns True on success."""
+def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str) -> dict:
+    """Login to PCC via Selenium and return session cookies."""
     driver.get("https://www.propertycontrolcenter.com/users/")
-    time.sleep(5)
+    time.sleep(3)
 
     wait = WebDriverWait(driver, 20)
     username_field = wait.until(EC.presence_of_element_located((By.NAME, "username")))
@@ -102,7 +97,7 @@ def login(driver: webdriver.Chrome, username: str, password: str) -> bool:
         )
     )
     login_button.click()
-    time.sleep(8)
+    time.sleep(5)
 
     # Verify login succeeded
     wait.until(
@@ -114,13 +109,46 @@ def login(driver: webdriver.Chrome, username: str, password: str) -> bool:
     if driver.find_elements(By.NAME, "username"):
         raise Exception("Login form still present after login attempt")
 
-    return True
+    # Extract cookies for use with requests library
+    cookies = {}
+    for cookie in driver.get_cookies():
+        cookies[cookie["name"]] = cookie["value"]
+
+    return cookies
 
 
-def navigate_to_power_search(driver: webdriver.Chrome):
-    """Navigate to the Power Search page."""
+def get_saved_search_id(cookies: dict, search_name: str) -> Optional[str]:
+    """Try to find the saved search ID by loading the power search page."""
+    session = http_requests.Session()
+    session.cookies.update(cookies)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    })
+
+    # Load power search page to find saved searches
+    resp = session.get("https://www.propertycontrolcenter.com/users/?action=powersearch")
+    if resp.status_code != 200:
+        return None
+
+    # Look for saved search links in the HTML
+    # Pattern: savedSearchId=XXXXX or similar
+    html = resp.text
+    # Try to find the search by name in the page
+    pattern = rf'data-searchid=["\'](\d+)["\'][^>]*>{re.escape(search_name)}'
+    match = re.search(pattern, html, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+# ─── Fallback: Full Selenium Scrape ──────────────────
+
+def full_selenium_scrape(driver: webdriver.Chrome, search_name: str, max_pages: int) -> list:
+    """Fallback: do the entire scrape with Selenium (original approach)."""
     wait = WebDriverWait(driver, 20)
 
+    # Navigate to Power Search
     search_menu = wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//li[@class='toproot']/a[text()='Search']")
@@ -136,13 +164,7 @@ def navigate_to_power_search(driver: webdriver.Chrome):
     )
     power_search_link.click()
     time.sleep(5)
-
     wait.until(EC.presence_of_element_located((By.ID, "reportFilter")))
-
-
-def load_saved_search(driver: webdriver.Chrome, search_name: str):
-    """Load and run a saved search by name."""
-    wait = WebDriverWait(driver, 20)
 
     # Close popup if present
     try:
@@ -153,7 +175,7 @@ def load_saved_search(driver: webdriver.Chrome, search_name: str):
     except Exception:
         pass
 
-    # Click "Load a Saved Search"
+    # Load saved search
     load_saved_link = wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//a[contains(text(), 'Load a Saved Search')]")
@@ -161,11 +183,8 @@ def load_saved_search(driver: webdriver.Chrome, search_name: str):
     )
     load_saved_link.click()
     time.sleep(2)
-
-    # Wait for saved searches popup
     wait.until(EC.presence_of_element_located((By.ID, "savedPowerSearches-body")))
 
-    # Find and run the saved search
     search_row = wait.until(
         EC.presence_of_element_located(
             (By.XPATH, f"//td[contains(@class, 'description-td') and contains(text(), '{search_name}')]/ancestor::tr")
@@ -174,12 +193,19 @@ def load_saved_search(driver: webdriver.Chrome, search_name: str):
     run_link = search_row.find_element(By.XPATH, ".//td[3]/a[contains(text(), 'Run')]")
     run_link.click()
     time.sleep(5)
-
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
 
+    # Export pages
+    export_folder = tempfile.mkdtemp(prefix="scraper-exports-")
+    csv_files = export_all_pages_selenium(driver, export_folder, max_pages)
+    df = merge_csvs(csv_files)
+    shutil.rmtree(export_folder, ignore_errors=True)
 
-def export_all_pages(driver: webdriver.Chrome, export_folder: str, max_pages: int = 30) -> list:
-    """Export CSV from each page of search results and return list of file paths."""
+    return df.to_dict(orient="records") if not df.empty else []
+
+
+def export_all_pages_selenium(driver, export_folder, max_pages):
+    """Export CSV from each page via Selenium."""
     wait = WebDriverWait(driver, 30)
     current_page = 1
     csv_files = []
@@ -200,6 +226,12 @@ def export_all_pages(driver: webdriver.Chrome, export_folder: str, max_pages: in
                 return max(new_files, key=os.path.getctime)
             time.sleep(0.5)
         raise TimeoutException("Download timed out")
+
+    # Need to set download directory for Selenium
+    driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+        "behavior": "allow",
+        "downloadPath": export_folder,
+    })
 
     while current_page <= max_pages:
         try:
@@ -229,7 +261,6 @@ def export_all_pages(driver: webdriver.Chrome, export_folder: str, max_pages: in
             print(f"Error exporting page {current_page}: {e}")
             break
 
-        # Navigate to next page
         if current_page < max_pages:
             try:
                 next_link = wait.until(
@@ -264,11 +295,53 @@ def merge_csvs(csv_files: list) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True).fillna("")
 
 
+# ─── Streaming Scrape ─────────────────────────────────
+
+def scrape_stream(username: str, password: str, search_name: str, max_pages: int):
+    """Generator that yields SSE events during the scrape process."""
+    driver = None
+    try:
+        # Step 1: Launch browser
+        yield f"event: status\ndata: {json.dumps({'step': 'browser', 'message': 'Launching browser...'})}\n\n"
+        driver = create_driver()
+
+        # Step 2: Login
+        yield f"event: status\ndata: {json.dumps({'step': 'login', 'message': 'Logging into Property Control Center...'})}\n\n"
+        cookies = login_and_get_cookies(driver, username, password)
+        yield f"event: status\ndata: {json.dumps({'step': 'logged_in', 'message': 'Login successful, starting scrape...'})}\n\n"
+
+        # Step 3: Scrape using Selenium (with progress updates)
+        listings = full_selenium_scrape(driver, search_name, max_pages)
+
+        # Close driver ASAP to free memory
+        driver.quit()
+        driver = None
+
+        yield f"event: status\ndata: {json.dumps({'step': 'scraped', 'message': f'Found {len(listings)} listings'})}\n\n"
+
+        # Step 4: Done
+        result = {
+            "listings": listings,
+            "total_count": len(listings),
+            "pages_scraped": max_pages,
+        }
+        yield f"event: complete\ndata: {json.dumps(result)}\n\n"
+
+    except Exception as e:
+        yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
 # ─── Endpoints ────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "listing-notifier-scraper"}
+    return {"status": "ok", "service": "listing-notifier-scraper", "version": "2.0.0"}
 
 
 @app.post("/test-login")
@@ -280,9 +353,8 @@ async def test_login(
 
     driver = None
     try:
-        export_folder = tempfile.mkdtemp(prefix="scraper-exports-")
-        driver = create_driver(export_folder)
-        login(driver, req.username, req.password)
+        driver = create_driver()
+        login_and_get_cookies(driver, req.username, req.password)
         return {"success": True, "message": "Login successful"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Login failed: {str(e)}")
@@ -302,42 +374,22 @@ async def scrape(
     verify_auth(authorization)
 
     driver = None
-    export_folder = tempfile.mkdtemp(prefix="scraper-exports-")
-
     try:
-        # 1. Create driver and login
-        driver = create_driver(export_folder)
-        login(driver, req.username, req.password)
+        # Launch browser and login
+        driver = create_driver()
+        cookies = login_and_get_cookies(driver, req.username, req.password)
 
-        # 2. Navigate to Power Search
-        navigate_to_power_search(driver)
+        # Do the full scrape
+        listings = full_selenium_scrape(driver, req.saved_search_name, req.max_pages)
 
-        # 3. Load saved search
-        load_saved_search(driver, req.saved_search_name)
-
-        # 4. Export all pages
-        csv_files = export_all_pages(driver, export_folder, req.max_pages)
-
-        # 5. Merge CSVs
-        df = merge_csvs(csv_files)
-
-        # 6. Clean up driver
+        # Close driver ASAP
         driver.quit()
         driver = None
-
-        if df.empty:
-            return {"listings": [], "total_count": 0, "pages_scraped": 0}
-
-        # 7. Convert to list of dicts
-        listings = df.to_dict(orient="records")
-
-        # 8. Clean up temp files
-        shutil.rmtree(export_folder, ignore_errors=True)
 
         return {
             "listings": listings,
             "total_count": len(listings),
-            "pages_scraped": len(csv_files),
+            "pages_scraped": req.max_pages,
         }
 
     except Exception as e:
@@ -348,4 +400,18 @@ async def scrape(
                 driver.quit()
             except Exception:
                 pass
-        shutil.rmtree(export_folder, ignore_errors=True)
+
+
+@app.post("/scrape-stream")
+async def scrape_streamed(
+    req: ScrapeRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """Streaming endpoint that sends progress events during the scrape."""
+    verify_auth(authorization)
+
+    return StreamingResponse(
+        scrape_stream(req.username, req.password, req.saved_search_name, req.max_pages),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
