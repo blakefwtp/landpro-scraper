@@ -26,7 +26,7 @@ from selenium.webdriver.support.ui import Select
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import json
 
-app = FastAPI(title="Listing Notifier Scraper", version="3.1.0")
+app = FastAPI(title="Listing Notifier Scraper", version="3.2.0")
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -507,7 +507,7 @@ def _do_test_login(username: str, password: str) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "listing-notifier-scraper", "version": "3.1.0"}
+    return {"status": "ok", "service": "listing-notifier-scraper", "version": "3.2.0"}
 
 
 @app.post("/test-login")
