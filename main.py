@@ -69,7 +69,15 @@ def create_driver() -> tuple[webdriver.Chrome, str]:
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-extensions")
-    options.add_argument("--disable-images")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-translate")
+    options.add_argument("--metrics-recording-only")
+    options.add_argument("--no-first-run")
+    options.add_argument("--safebrowsing-disable-auto-update")
+    options.add_argument("--blink-settings=imagesEnabled=false")
     options.add_argument(
         "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
@@ -458,20 +466,29 @@ def merge_csvs(csv_files: list) -> pd.DataFrame:
 # ─── Synchronous scrape logic (runs in thread pool) ──
 
 def _do_scrape(username: str, password: str, listing_status: str, time_range: str, max_pages: int) -> dict:
-    """Run the full scrape in a blocking thread. Returns result dict or raises."""
-    driver = None
-    temp_profile = None
-    try:
-        driver, temp_profile = create_driver()
-        login_and_get_cookies(driver, username, password)
-        listings = run_power_search(driver, listing_status, time_range, max_pages)
-        return {
-            "listings": listings,
-            "total_count": len(listings),
-            "pages_scraped": max_pages,
-        }
-    finally:
-        cleanup_driver(driver, temp_profile)
+    """Run the full scrape in a blocking thread with retry on Chrome crash."""
+    last_error = None
+    for attempt in range(2):
+        driver = None
+        temp_profile = None
+        try:
+            print(f"Scrape attempt {attempt + 1}/2")
+            driver, temp_profile = create_driver()
+            login_and_get_cookies(driver, username, password)
+            listings = run_power_search(driver, listing_status, time_range, max_pages)
+            return {
+                "listings": listings,
+                "total_count": len(listings),
+                "pages_scraped": max_pages,
+            }
+        except Exception as e:
+            last_error = e
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt == 0:
+                time.sleep(3)
+        finally:
+            cleanup_driver(driver, temp_profile)
+    raise last_error
 
 
 def _do_test_login(username: str, password: str) -> dict:
