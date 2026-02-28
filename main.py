@@ -507,7 +507,42 @@ def _do_test_login(username: str, password: str) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "listing-notifier-scraper", "version": "3.2.0"}
+    return {"status": "ok", "service": "listing-notifier-scraper", "version": "3.3.0"}
+
+
+@app.get("/debug")
+async def debug():
+    """Check Chrome and ChromeDriver versions and test browser launch."""
+    import subprocess
+    info = {"service_version": "3.3.0"}
+
+    # Chrome version
+    try:
+        result = subprocess.run(["google-chrome", "--version"], capture_output=True, text=True, timeout=10)
+        info["chrome_version"] = result.stdout.strip()
+    except Exception as e:
+        info["chrome_version_error"] = str(e)
+
+    # ChromeDriver version
+    try:
+        result = subprocess.run(["chromedriver", "--version"], capture_output=True, text=True, timeout=10)
+        info["chromedriver_version"] = result.stdout.strip()
+    except Exception as e:
+        info["chromedriver_version"] = "Not installed (using SeleniumManager)"
+
+    # Try to start Chrome
+    try:
+        driver, temp_profile = create_driver()
+        info["browser_launch"] = "success"
+        info["browser_name"] = driver.capabilities.get("browserName", "unknown")
+        info["browser_version"] = driver.capabilities.get("browserVersion", "unknown")
+        info["chromedriver_actual"] = driver.capabilities.get("chrome", {}).get("chromedriverVersion", "unknown")
+        cleanup_driver(driver, temp_profile)
+    except Exception as e:
+        info["browser_launch"] = "failed"
+        info["browser_error"] = str(e)
+
+    return info
 
 
 @app.post("/test-login")

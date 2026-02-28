@@ -1,6 +1,6 @@
 FROM python:3.11-slim-bookworm
 
-# Install Chrome
+# Install Chrome dependencies and Chrome
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -11,18 +11,8 @@ RUN apt-get update && apt-get install -y \
     && rm /tmp/google-chrome.deb \
     && rm -rf /var/lib/apt/lists/*
 
-# Install ChromeDriver matching Chrome version
-RUN CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') \
-    && DRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}.0/linux64/chromedriver-linux64.zip" \
-    && wget -q "$DRIVER_URL" -O /tmp/chromedriver.zip || true \
-    && if [ -f /tmp/chromedriver.zip ]; then \
-         unzip /tmp/chromedriver.zip -d /tmp/ && \
-         mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/ && \
-         chmod +x /usr/local/bin/chromedriver; \
-       else \
-         echo "Using selenium-manager for chromedriver"; \
-       fi \
-    && rm -rf /tmp/chromedriver*
+# Don't manually install ChromeDriver — let Selenium 4's built-in
+# SeleniumManager download the correct matching version at runtime.
 
 WORKDIR /app
 
