@@ -5,6 +5,7 @@ Hybrid approach: Selenium for login + Power Search form interaction, then CSV ex
 
 import os
 import time
+import asyncio
 import tempfile
 import shutil
 import re
@@ -25,7 +26,7 @@ from selenium.webdriver.support.ui import Select
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import json
 
-app = FastAPI(title="Listing Notifier Scraper", version="3.0.0")
+app = FastAPI(title="Listing Notifier Scraper", version="3.1.0")
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -59,8 +60,8 @@ def verify_auth(authorization: Optional[str] = None):
 
 # ─── Selenium Helpers ─────────────────────────────────
 
-def create_driver() -> webdriver.Chrome:
-    """Create a headless Chrome WebDriver."""
+def create_driver() -> tuple[webdriver.Chrome, str]:
+    """Create a headless Chrome WebDriver. Returns (driver, temp_profile_path)."""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
@@ -78,7 +79,21 @@ def create_driver() -> webdriver.Chrome:
     options.add_argument(f"--user-data-dir={temp_profile}")
 
     driver = webdriver.Chrome(options=options)
-    return driver
+    return driver, temp_profile
+
+
+def cleanup_driver(driver: Optional[webdriver.Chrome], temp_profile: Optional[str]):
+    """Safely quit driver and remove temp profile directory."""
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    if temp_profile:
+        try:
+            shutil.rmtree(temp_profile, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str) -> dict:
@@ -440,11 +455,42 @@ def merge_csvs(csv_files: list) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True).fillna("")
 
 
+# ─── Synchronous scrape logic (runs in thread pool) ──
+
+def _do_scrape(username: str, password: str, listing_status: str, time_range: str, max_pages: int) -> dict:
+    """Run the full scrape in a blocking thread. Returns result dict or raises."""
+    driver = None
+    temp_profile = None
+    try:
+        driver, temp_profile = create_driver()
+        login_and_get_cookies(driver, username, password)
+        listings = run_power_search(driver, listing_status, time_range, max_pages)
+        return {
+            "listings": listings,
+            "total_count": len(listings),
+            "pages_scraped": max_pages,
+        }
+    finally:
+        cleanup_driver(driver, temp_profile)
+
+
+def _do_test_login(username: str, password: str) -> dict:
+    """Run login test in a blocking thread."""
+    driver = None
+    temp_profile = None
+    try:
+        driver, temp_profile = create_driver()
+        login_and_get_cookies(driver, username, password)
+        return {"success": True, "message": "Login successful"}
+    finally:
+        cleanup_driver(driver, temp_profile)
+
+
 # ─── Endpoints ────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "listing-notifier-scraper", "version": "3.0.0"}
+    return {"status": "ok", "service": "listing-notifier-scraper", "version": "3.1.0"}
 
 
 @app.post("/test-login")
@@ -453,20 +499,11 @@ async def test_login(
     authorization: Optional[str] = Header(None),
 ):
     verify_auth(authorization)
-
-    driver = None
     try:
-        driver = create_driver()
-        login_and_get_cookies(driver, req.username, req.password)
-        return {"success": True, "message": "Login successful"}
+        result = await asyncio.to_thread(_do_test_login, req.username, req.password)
+        return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Login failed: {str(e)}")
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 
 
 @app.post("/scrape")
@@ -475,34 +512,14 @@ async def scrape(
     authorization: Optional[str] = Header(None),
 ):
     verify_auth(authorization)
-
-    driver = None
     try:
-        # Launch browser and login
-        driver = create_driver()
-        login_and_get_cookies(driver, req.username, req.password)  # logs in via Selenium
-
-        # Run Power Search with custom filters (driver is already logged in)
-        listings = run_power_search(driver, req.listing_status, req.time_range, req.max_pages)
-
-        # Close driver ASAP
-        driver.quit()
-        driver = None
-
-        return {
-            "listings": listings,
-            "total_count": len(listings),
-            "pages_scraped": req.max_pages,
-        }
-
+        result = await asyncio.to_thread(
+            _do_scrape, req.username, req.password,
+            req.listing_status, req.time_range, req.max_pages,
+        )
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 
 
 @app.post("/scrape-stream")
@@ -515,18 +532,16 @@ async def scrape_streamed(
 
     def generate():
         driver = None
+        temp_profile = None
         try:
             yield f"event: status\ndata: {json.dumps({'step': 'browser', 'message': 'Launching browser...'})}\n\n"
-            driver = create_driver()
+            driver, temp_profile = create_driver()
 
             yield f"event: status\ndata: {json.dumps({'step': 'login', 'message': 'Logging into Property Control Center...'})}\n\n"
             login_and_get_cookies(driver, req.username, req.password)
             yield f"event: status\ndata: {json.dumps({'step': 'logged_in', 'message': 'Login successful, running search...'})}\n\n"
 
             listings = run_power_search(driver, req.listing_status, req.time_range, req.max_pages)
-
-            driver.quit()
-            driver = None
 
             yield f"event: status\ndata: {json.dumps({'step': 'scraped', 'message': f'Found {len(listings)} listings'})}\n\n"
 
@@ -540,11 +555,7 @@ async def scrape_streamed(
         except Exception as e:
             yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
         finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+            cleanup_driver(driver, temp_profile)
 
     return StreamingResponse(
         generate(),
