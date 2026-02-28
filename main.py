@@ -1,16 +1,16 @@
 """
 Listing Notifier Scraper Service
-Hybrid approach: Selenium for login, then direct HTTP for data export.
+Hybrid approach: Selenium for login + Power Search form interaction, then CSV export.
 """
 
 import os
-import io
 import time
 import tempfile
 import shutil
 import re
-import requests as http_requests
+import requests as http_requests  # kept for potential future HTTP-based scraping
 from typing import Optional
+from datetime import datetime, timedelta
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Header
@@ -21,10 +21,11 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.support.ui import Select
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import json
 
-app = FastAPI(title="Listing Notifier Scraper", version="2.0.0")
+app = FastAPI(title="Listing Notifier Scraper", version="3.0.0")
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -35,7 +36,7 @@ class ScrapeRequest(BaseModel):
     username: str
     password: str
     time_range: str = "7d"
-    saved_search_name: str = "New Listings - last week"
+    listing_status: str = "Active"
     max_pages: int = 30
 
 
@@ -117,38 +118,12 @@ def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str
     return cookies
 
 
-def get_saved_search_id(cookies: dict, search_name: str) -> Optional[str]:
-    """Try to find the saved search ID by loading the power search page."""
-    session = http_requests.Session()
-    session.cookies.update(cookies)
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    })
+# ─── Power Search with Custom Filters ────────────────
 
-    # Load power search page to find saved searches
-    resp = session.get("https://www.propertycontrolcenter.com/users/?action=powersearch")
-    if resp.status_code != 200:
-        return None
-
-    # Look for saved search links in the HTML
-    # Pattern: savedSearchId=XXXXX or similar
-    html = resp.text
-    # Try to find the search by name in the page
-    pattern = rf'data-searchid=["\'](\d+)["\'][^>]*>{re.escape(search_name)}'
-    match = re.search(pattern, html, re.IGNORECASE)
-    if match:
-        return match.group(1)
-
-    return None
-
-
-# ─── Fallback: Full Selenium Scrape ──────────────────
-
-def full_selenium_scrape(driver: webdriver.Chrome, search_name: str, max_pages: int) -> list:
-    """Fallback: do the entire scrape with Selenium (original approach)."""
+def navigate_to_power_search(driver: webdriver.Chrome):
+    """Navigate to the Power Search page and wait for the form to load."""
     wait = WebDriverWait(driver, 20)
 
-    # Navigate to Power Search
     search_menu = wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//li[@class='toproot']/a[text()='Search']")
@@ -168,34 +143,204 @@ def full_selenium_scrape(driver: webdriver.Chrome, search_name: str, max_pages: 
 
     # Close popup if present
     try:
-        wait.until(EC.presence_of_element_located((By.ID, "panel-1012-bodyWrap")))
+        driver.find_element(By.ID, "panel-1012-bodyWrap")
         close_button = wait.until(EC.element_to_be_clickable((By.ID, "tool-1013")))
         close_button.click()
         time.sleep(2)
     except Exception:
         pass
 
-    # Load saved search
-    load_saved_link = wait.until(
-        EC.element_to_be_clickable(
-            (By.XPATH, "//a[contains(text(), 'Load a Saved Search')]")
-        )
-    )
-    load_saved_link.click()
-    time.sleep(2)
-    wait.until(EC.presence_of_element_located((By.ID, "savedPowerSearches-body")))
 
-    search_row = wait.until(
-        EC.presence_of_element_located(
-            (By.XPATH, f"//td[contains(@class, 'description-td') and contains(text(), '{search_name}')]/ancestor::tr")
+def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: str) -> dict:
+    """
+    Attempt to set filter criteria on the Power Search form.
+    Returns a dict describing what was successfully set.
+    Uses multiple selector strategies with graceful fallbacks.
+    """
+    results = {"status_set": False, "date_set": False}
+
+    # ── Listing Status ──
+    # Strategy 1: Find select elements and check if any has status-like options
+    try:
+        selects = driver.find_elements(By.CSS_SELECTOR, "#reportFilter select")
+        for sel in selects:
+            try:
+                options = sel.find_elements(By.TAG_NAME, "option")
+                option_texts = [o.text.strip() for o in options]
+                if any(s in option_texts for s in ["Active", "Sold", "Pending", "New"]):
+                    select_obj = Select(sel)
+                    select_obj.select_by_visible_text(listing_status)
+                    results["status_set"] = True
+                    print(f"Set listing status to '{listing_status}' via select dropdown")
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Strategy 1 (select) for status failed: {e}")
+
+    # Strategy 2: Find checkboxes near status labels
+    if not results["status_set"]:
+        try:
+            status_labels = driver.find_elements(
+                By.XPATH,
+                f"//label[normalize-space()='{listing_status}']"
+            )
+            for label in status_labels:
+                try:
+                    cb = label.find_element(By.XPATH, ".//input[@type='checkbox'] | ./preceding-sibling::input[@type='checkbox'][1] | ./following-sibling::input[@type='checkbox'][1]")
+                    if not cb.is_selected():
+                        cb.click()
+                        time.sleep(0.3)
+                    results["status_set"] = True
+                    print(f"Set listing status '{listing_status}' via checkbox")
+                    break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"Strategy 2 (checkbox) for status failed: {e}")
+
+    # ── Date Range ──
+    days_map = {"24h": 1, "7d": 7, "14d": 14, "30d": 30}
+    days = days_map.get(time_range, 7)
+
+    # Strategy 1: Look for "Days on Market" or "DOM" input
+    try:
+        dom_inputs = driver.find_elements(
+            By.XPATH,
+            "//input[contains(@name, 'days') or contains(@name, 'dom') or "
+            "contains(@name, 'Days') or contains(@name, 'DOM') or "
+            "contains(@id, 'days') or contains(@id, 'dom')]"
         )
-    )
-    run_link = search_row.find_element(By.XPATH, ".//td[3]/a[contains(text(), 'Run')]")
-    run_link.click()
+        if dom_inputs:
+            dom_inputs[0].clear()
+            dom_inputs[0].send_keys(str(days))
+            results["date_set"] = True
+            print(f"Set days on market to {days}")
+    except Exception as e:
+        print(f"Strategy 1 (DOM input) for date failed: {e}")
+
+    # Strategy 2: Look for date input fields and set a date range
+    if not results["date_set"]:
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+
+            date_inputs = driver.find_elements(
+                By.XPATH,
+                "//input[contains(@name, 'date') or contains(@name, 'Date') or "
+                "contains(@id, 'date') or contains(@id, 'Date') or @type='date']"
+            )
+            if len(date_inputs) >= 2:
+                date_inputs[0].clear()
+                date_inputs[0].send_keys(start_date.strftime("%m/%d/%Y"))
+                date_inputs[1].clear()
+                date_inputs[1].send_keys(end_date.strftime("%m/%d/%Y"))
+                results["date_set"] = True
+                print(f"Set date range: {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}")
+        except Exception as e:
+            print(f"Strategy 2 (date inputs) for date failed: {e}")
+
+    # Strategy 3: Look for a time range select
+    if not results["date_set"]:
+        try:
+            selects = driver.find_elements(By.CSS_SELECTOR, "#reportFilter select")
+            for sel in selects:
+                try:
+                    options = sel.find_elements(By.TAG_NAME, "option")
+                    option_texts = [o.text.strip().lower() for o in options]
+                    if any(kw in " ".join(option_texts) for kw in ["day", "week", "month", "hour"]):
+                        select_obj = Select(sel)
+                        # Try to find an option matching our time range
+                        target_texts = {
+                            "24h": ["24 hours", "1 day", "last 24", "today"],
+                            "7d": ["7 days", "1 week", "last 7", "last week"],
+                            "14d": ["14 days", "2 weeks", "last 14"],
+                            "30d": ["30 days", "1 month", "last 30", "last month"],
+                        }
+                        for target in target_texts.get(time_range, []):
+                            for option in options:
+                                if target.lower() in option.text.strip().lower():
+                                    select_obj.select_by_visible_text(option.text.strip())
+                                    results["date_set"] = True
+                                    print(f"Set time range via select: {option.text.strip()}")
+                                    break
+                            if results["date_set"]:
+                                break
+                        if results["date_set"]:
+                            break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"Strategy 3 (time select) for date failed: {e}")
+
+    return results
+
+
+def submit_search_form(driver: webdriver.Chrome):
+    """Find and click the search/submit button on the Power Search form."""
+    wait = WebDriverWait(driver, 10)
+
+    selectors = [
+        (By.CSS_SELECTOR, "#reportFilter input[type='submit']"),
+        (By.XPATH, "//input[@value='Search']"),
+        (By.XPATH, "//input[@value='Run Search']"),
+        (By.XPATH, "//input[@value='Run']"),
+        (By.XPATH, "//button[contains(text(), 'Search')]"),
+        (By.XPATH, "//a[contains(@class, 'search-btn')]"),
+        (By.CSS_SELECTOR, "form#reportFilter button[type='submit']"),
+    ]
+
+    for selector_type, selector_value in selectors:
+        try:
+            btn = driver.find_element(selector_type, selector_value)
+            if btn.is_displayed():
+                btn.click()
+                print(f"Clicked search button via: {selector_value}")
+                return True
+        except Exception:
+            continue
+
+    # Last resort: submit the form directly via JavaScript
+    try:
+        driver.execute_script("document.getElementById('reportFilter').submit()")
+        print("Submitted form via JavaScript")
+        return True
+    except Exception:
+        pass
+
+    raise Exception("Could not find or click search button on Power Search page")
+
+
+def run_power_search(driver: webdriver.Chrome, listing_status: str, time_range: str, max_pages: int) -> list:
+    """
+    Navigate to Power Search, set filters, run the search, and export results.
+    This replaces the old saved-search approach.
+    """
+    wait = WebDriverWait(driver, 20)
+
+    # 1. Navigate to Power Search
+    navigate_to_power_search(driver)
+
+    # 2. Try to set search filters
+    filter_results = try_set_filters(driver, listing_status, time_range)
+    print(f"Filter results: {filter_results}")
+
+    # 3. Submit the search
+    submit_search_form(driver)
     time.sleep(5)
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
 
-    # Export pages
+    # 4. Wait for results table
+    try:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
+    except TimeoutException:
+        # Check if there's a "no results" message
+        page_text = driver.page_source.lower()
+        if "no results" in page_text or "no records" in page_text or "no listings" in page_text:
+            print("Search returned no results")
+            return []
+        raise Exception("Timed out waiting for search results table")
+
+    # 5. Export all pages
     export_folder = tempfile.mkdtemp(prefix="scraper-exports-")
     csv_files = export_all_pages_selenium(driver, export_folder, max_pages)
     df = merge_csvs(csv_files)
@@ -295,53 +440,11 @@ def merge_csvs(csv_files: list) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True).fillna("")
 
 
-# ─── Streaming Scrape ─────────────────────────────────
-
-def scrape_stream(username: str, password: str, search_name: str, max_pages: int):
-    """Generator that yields SSE events during the scrape process."""
-    driver = None
-    try:
-        # Step 1: Launch browser
-        yield f"event: status\ndata: {json.dumps({'step': 'browser', 'message': 'Launching browser...'})}\n\n"
-        driver = create_driver()
-
-        # Step 2: Login
-        yield f"event: status\ndata: {json.dumps({'step': 'login', 'message': 'Logging into Property Control Center...'})}\n\n"
-        cookies = login_and_get_cookies(driver, username, password)
-        yield f"event: status\ndata: {json.dumps({'step': 'logged_in', 'message': 'Login successful, starting scrape...'})}\n\n"
-
-        # Step 3: Scrape using Selenium (with progress updates)
-        listings = full_selenium_scrape(driver, search_name, max_pages)
-
-        # Close driver ASAP to free memory
-        driver.quit()
-        driver = None
-
-        yield f"event: status\ndata: {json.dumps({'step': 'scraped', 'message': f'Found {len(listings)} listings'})}\n\n"
-
-        # Step 4: Done
-        result = {
-            "listings": listings,
-            "total_count": len(listings),
-            "pages_scraped": max_pages,
-        }
-        yield f"event: complete\ndata: {json.dumps(result)}\n\n"
-
-    except Exception as e:
-        yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-
-
 # ─── Endpoints ────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "listing-notifier-scraper", "version": "2.0.0"}
+    return {"status": "ok", "service": "listing-notifier-scraper", "version": "3.0.0"}
 
 
 @app.post("/test-login")
@@ -377,10 +480,10 @@ async def scrape(
     try:
         # Launch browser and login
         driver = create_driver()
-        cookies = login_and_get_cookies(driver, req.username, req.password)
+        login_and_get_cookies(driver, req.username, req.password)  # logs in via Selenium
 
-        # Do the full scrape
-        listings = full_selenium_scrape(driver, req.saved_search_name, req.max_pages)
+        # Run Power Search with custom filters (driver is already logged in)
+        listings = run_power_search(driver, req.listing_status, req.time_range, req.max_pages)
 
         # Close driver ASAP
         driver.quit()
@@ -410,8 +513,41 @@ async def scrape_streamed(
     """Streaming endpoint that sends progress events during the scrape."""
     verify_auth(authorization)
 
+    def generate():
+        driver = None
+        try:
+            yield f"event: status\ndata: {json.dumps({'step': 'browser', 'message': 'Launching browser...'})}\n\n"
+            driver = create_driver()
+
+            yield f"event: status\ndata: {json.dumps({'step': 'login', 'message': 'Logging into Property Control Center...'})}\n\n"
+            login_and_get_cookies(driver, req.username, req.password)
+            yield f"event: status\ndata: {json.dumps({'step': 'logged_in', 'message': 'Login successful, running search...'})}\n\n"
+
+            listings = run_power_search(driver, req.listing_status, req.time_range, req.max_pages)
+
+            driver.quit()
+            driver = None
+
+            yield f"event: status\ndata: {json.dumps({'step': 'scraped', 'message': f'Found {len(listings)} listings'})}\n\n"
+
+            result = {
+                "listings": listings,
+                "total_count": len(listings),
+                "pages_scraped": req.max_pages,
+            }
+            yield f"event: complete\ndata: {json.dumps(result)}\n\n"
+
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
     return StreamingResponse(
-        scrape_stream(req.username, req.password, req.saved_search_name, req.max_pages),
+        generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
