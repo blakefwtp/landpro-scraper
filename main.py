@@ -342,7 +342,7 @@ def submit_search_form(driver: webdriver.Chrome):
     raise Exception("Could not find or click search button on Power Search page")
 
 
-def run_power_search(driver: webdriver.Chrome, listing_status: str, time_range: str, max_pages: int) -> list:
+def run_power_search(driver: webdriver.Chrome, listing_status: str, time_range: str, max_pages: int, deadline: float = 0) -> list:
     """Navigate to Power Search, set filters, run the search, and export results."""
     wait = WebDriverWait(driver, 15)
 
@@ -364,12 +364,11 @@ def run_power_search(driver: webdriver.Chrome, listing_status: str, time_range: 
         if "no results" in page_text or "no records" in page_text or "no listings" in page_text:
             log("Search returned no results")
             return []
-        # Save page source for debugging
         log(f"No results table found. Page title: {driver.title}")
         raise Exception("Timed out waiting for search results table")
 
     export_folder = tempfile.mkdtemp(prefix="scraper-exports-")
-    csv_files = export_all_pages_selenium(driver, export_folder, max_pages)
+    csv_files = export_all_pages_selenium(driver, export_folder, max_pages, deadline)
     df = merge_csvs(csv_files)
     shutil.rmtree(export_folder, ignore_errors=True)
 
@@ -378,8 +377,8 @@ def run_power_search(driver: webdriver.Chrome, listing_status: str, time_range: 
     return listings
 
 
-def export_all_pages_selenium(driver, export_folder, max_pages):
-    """Export CSV from each page via Selenium."""
+def export_all_pages_selenium(driver, export_folder, max_pages, deadline: float = 0):
+    """Export CSV from each page via Selenium. Stops early if deadline approaching."""
     wait = WebDriverWait(driver, 20)
     current_page = 1
     csv_files = []
@@ -407,6 +406,11 @@ def export_all_pages_selenium(driver, export_folder, max_pages):
     })
 
     while current_page <= max_pages:
+        # Check deadline before starting a new page
+        if deadline and time.time() > deadline - 30:
+            log(f"Approaching timeout, stopping after {current_page - 1} pages (have {len(csv_files)} exports)")
+            break
+
         log(f"Exporting page {current_page}...")
         try:
             export_link = wait.until(
@@ -473,16 +477,25 @@ def merge_csvs(csv_files: list) -> pd.DataFrame:
 
 # ─── Synchronous scrape logic (runs in thread pool) ──
 
+SCRAPE_TIMEOUT_SECONDS = 210  # 3.5 minutes — leaves headroom for the 5-min route timeout
+
 def _do_scrape(username: str, password: str, listing_status: str, time_range: str, max_pages: int) -> dict:
-    """Run the full scrape in a blocking thread."""
+    """Run the full scrape in a blocking thread with internal timeout."""
     driver = None
     temp_profile = None
+    scrape_start = time.time()
     try:
-        log("Starting scrape...")
+        log(f"Starting scrape (max_pages={max_pages}, timeout={SCRAPE_TIMEOUT_SECONDS}s)...")
         driver, temp_profile = create_driver()
         log("Chrome launched successfully")
         login_and_get_cookies(driver, username, password)
-        listings = run_power_search(driver, listing_status, time_range, max_pages)
+
+        elapsed = time.time() - scrape_start
+        remaining = SCRAPE_TIMEOUT_SECONDS - elapsed
+        if remaining < 30:
+            raise Exception(f"Login took too long ({elapsed:.0f}s), no time left for search")
+
+        listings = run_power_search(driver, listing_status, time_range, max_pages, deadline=scrape_start + SCRAPE_TIMEOUT_SECONDS)
         return {
             "listings": listings,
             "total_count": len(listings),
