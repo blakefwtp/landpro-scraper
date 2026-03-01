@@ -39,6 +39,7 @@ class ScrapeRequest(BaseModel):
     time_range: str = "7d"
     listing_status: str = "Active"
     max_pages: int = 50
+    min_acres: float = 0
 
 
 class LoginTestRequest(BaseModel):
@@ -198,9 +199,9 @@ def navigate_to_power_search(driver: webdriver.Chrome):
         pass
 
 
-def set_filters(driver: webdriver.Chrome, listing_status: str, time_range: str) -> dict:
-    """Set filter criteria on the Power Search form."""
-    results = {"status_set": False, "date_set": False}
+def set_filters(driver: webdriver.Chrome, listing_status: str, time_range: str, min_acres: float = 0) -> dict:
+    """Set filter criteria on the Power Search form to match manual search."""
+    results = {"status_set": False, "date_set": False, "state_set": False, "acres_set": False}
 
     # ── Listing Status (select dropdown) ──
     try:
@@ -211,12 +212,38 @@ def set_filters(driver: webdriver.Chrome, listing_status: str, time_range: str) 
     except Exception as e:
         log(f"Could not set status: {e}")
 
+    # ── Search by State → Texas ──
+    try:
+        # Click "State" radio button
+        state_radio = driver.find_element(
+            By.CSS_SELECTOR, "#reportFilter input[name='Search'][value='State']"
+        )
+        driver.execute_script("arguments[0].click();", state_radio)
+        time.sleep(1)
+
+        # The state selector uses a tag-input library that hides the real <select>.
+        # Inject Texas (state_id=48) directly via JavaScript.
+        driver.execute_script("""
+            var sel = document.getElementById('stateSelector');
+            if (sel) {
+                var opt = document.createElement('option');
+                opt.value = '48';
+                opt.text = 'Texas';
+                opt.selected = true;
+                sel.add(opt);
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        """)
+        results["state_set"] = True
+        log("Set state to Texas (state_id=48)")
+    except Exception as e:
+        log(f"Could not set state filter: {e}")
+
     # ── Date Range (radio buttons: name='dt') ──
-    # Map time_range to PCC radio button values
     dt_map = {
         "24h": "Last24Hours",
         "7d": "LastWeek",
-        "14d": "LastMonth",  # No 14d option, use LastMonth as closest
+        "14d": "LastMonth",
         "30d": "LastMonth",
     }
     dt_value = dt_map.get(time_range, "LastWeek")
@@ -230,6 +257,17 @@ def set_filters(driver: webdriver.Chrome, listing_status: str, time_range: str) 
         log(f"Set date range to '{dt_value}' (from time_range='{time_range}')")
     except Exception as e:
         log(f"Could not set date range: {e}")
+
+    # ── Minimum Acreage (optional) ──
+    if min_acres > 0:
+        try:
+            la_input = driver.find_element(By.CSS_SELECTOR, "#reportFilter input[name='la']")
+            la_input.clear()
+            la_input.send_keys(str(int(min_acres)))
+            results["acres_set"] = True
+            log(f"Set minimum acreage to {int(min_acres)}")
+        except Exception as e:
+            log(f"Could not set min acreage: {e}")
 
     return results
 
@@ -346,7 +384,7 @@ def parse_csv_text(text: str) -> list:
 
 # ─── Main Scrape Logic ────────────────────────────────
 
-def _do_scrape(username: str, password: str, listing_status: str, time_range: str, max_pages: int) -> dict:
+def _do_scrape(username: str, password: str, listing_status: str, time_range: str, max_pages: int, min_acres: float = 0) -> dict:
     """
     Full scrape flow:
     1. Selenium login (~15s)
@@ -358,7 +396,7 @@ def _do_scrape(username: str, password: str, listing_status: str, time_range: st
     temp_profile = None
     scrape_start = time.time()
     try:
-        log(f"Starting scrape v5.0 (status={listing_status}, range={time_range}, max_pages={max_pages})...")
+        log(f"Starting scrape v5.0 (status={listing_status}, range={time_range}, max_pages={max_pages}, min_acres={min_acres})...")
         driver, temp_profile = create_driver()
         log(f"Chrome launched in {time.time() - scrape_start:.1f}s")
 
@@ -368,7 +406,7 @@ def _do_scrape(username: str, password: str, listing_status: str, time_range: st
 
         # Step 2: Navigate to Power Search and submit
         navigate_to_power_search(driver)
-        set_filters(driver, listing_status, time_range)
+        set_filters(driver, listing_status, time_range, min_acres)
         submit_search(driver)
         time.sleep(3)
 
@@ -504,6 +542,7 @@ async def scrape(
         result = await asyncio.to_thread(
             _do_scrape, req.username, req.password,
             req.listing_status, req.time_range, req.max_pages,
+            req.min_acres,
         )
         return result
     except Exception as e:
