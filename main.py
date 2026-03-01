@@ -300,9 +300,10 @@ def get_total_pages(driver: webdriver.Chrome, per_page: int = 15) -> int:
     page_text = driver.page_source
 
     # Look for "X results" or "X records" or "X properties" text
-    matches = re.findall(r'(\d+)\s+(?:total\s+)?(?:results?|records?|listings?|properties)', page_text, re.IGNORECASE)
+    # Handle comma-formatted numbers like "1,521 total results"
+    matches = re.findall(r'(\d[\d,]*)\s+(?:total\s+)?(?:results?|records?|listings?|properties)', page_text, re.IGNORECASE)
     if matches:
-        total_results = max(int(m) for m in matches)
+        total_results = max(int(m.replace(',', '')) for m in matches)
         total_pages = math.ceil(total_results / per_page)
         log(f"Found {total_results} total results -> {total_pages} pages")
         return total_pages
