@@ -24,7 +24,7 @@ from selenium.webdriver.support.ui import Select
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import json
 
-app = FastAPI(title="Listing Notifier Scraper", version="4.0.0")
+app = FastAPI(title="Listing Notifier Scraper", version="4.1.0")
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
