@@ -8,8 +8,6 @@ import time
 import asyncio
 import tempfile
 import shutil
-import re
-import requests as http_requests
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -26,7 +24,7 @@ from selenium.webdriver.support.ui import Select
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import json
 
-app = FastAPI(title="Listing Notifier Scraper", version="3.2.0")
+app = FastAPI(title="Listing Notifier Scraper", version="4.0.0")
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -58,6 +56,13 @@ def verify_auth(authorization: Optional[str] = None):
         raise HTTPException(status_code=401, detail="Invalid API secret")
 
 
+# ─── Logging helper ──────────────────────────────────
+
+def log(msg: str):
+    """Print with timestamp for Render logs."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 # ─── Selenium Helpers ─────────────────────────────────
 
 def create_driver() -> tuple[webdriver.Chrome, str]:
@@ -87,6 +92,8 @@ def create_driver() -> tuple[webdriver.Chrome, str]:
     options.add_argument(f"--user-data-dir={temp_profile}")
 
     driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(30)
+    driver.set_script_timeout(15)
     return driver, temp_profile
 
 
@@ -106,10 +113,12 @@ def cleanup_driver(driver: Optional[webdriver.Chrome], temp_profile: Optional[st
 
 def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str) -> dict:
     """Login to PCC via Selenium and return session cookies."""
+    log("Navigating to PCC login page...")
     driver.get("https://www.propertycontrolcenter.com/users/")
     time.sleep(3)
 
-    wait = WebDriverWait(driver, 20)
+    log("Filling login form...")
+    wait = WebDriverWait(driver, 15)
     username_field = wait.until(EC.presence_of_element_located((By.NAME, "username")))
     password_field = driver.find_element(By.NAME, "password")
     username_field.send_keys(username)
@@ -120,10 +129,12 @@ def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str
             (By.CSS_SELECTOR, "input[type='submit'][value='Login'], input.button.submit")
         )
     )
+    log("Clicking login button...")
     login_button.click()
     time.sleep(5)
 
     # Verify login succeeded
+    log("Verifying login success...")
     wait.until(
         EC.presence_of_element_located(
             (By.XPATH, "//li[@class='toproot']/a[text()='Search']")
@@ -133,11 +144,12 @@ def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str
     if driver.find_elements(By.NAME, "username"):
         raise Exception("Login form still present after login attempt")
 
-    # Extract cookies for use with requests library
+    # Extract cookies
     cookies = {}
     for cookie in driver.get_cookies():
         cookies[cookie["name"]] = cookie["value"]
 
+    log(f"Login successful, got {len(cookies)} cookies")
     return cookies
 
 
@@ -145,8 +157,9 @@ def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str
 
 def navigate_to_power_search(driver: webdriver.Chrome):
     """Navigate to the Power Search page and wait for the form to load."""
-    wait = WebDriverWait(driver, 20)
+    wait = WebDriverWait(driver, 15)
 
+    log("Clicking Search menu...")
     search_menu = wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//li[@class='toproot']/a[text()='Search']")
@@ -155,13 +168,16 @@ def navigate_to_power_search(driver: webdriver.Chrome):
     search_menu.click()
     time.sleep(1)
 
+    log("Clicking Power Search link...")
     power_search_link = wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//a[@href='/users/?action=powersearch'][text()='Power Search']")
         )
     )
     power_search_link.click()
-    time.sleep(5)
+    time.sleep(3)
+
+    log("Waiting for Power Search form...")
     wait.until(EC.presence_of_element_located((By.ID, "reportFilter")))
 
     # Close popup if present
@@ -169,21 +185,22 @@ def navigate_to_power_search(driver: webdriver.Chrome):
         driver.find_element(By.ID, "panel-1012-bodyWrap")
         close_button = wait.until(EC.element_to_be_clickable((By.ID, "tool-1013")))
         close_button.click()
-        time.sleep(2)
+        time.sleep(1)
+        log("Closed popup dialog")
     except Exception:
         pass
+
+    log("Power Search form loaded")
 
 
 def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: str) -> dict:
     """
     Attempt to set filter criteria on the Power Search form.
-    Returns a dict describing what was successfully set.
     Uses multiple selector strategies with graceful fallbacks.
     """
     results = {"status_set": False, "date_set": False}
 
     # ── Listing Status ──
-    # Strategy 1: Find select elements and check if any has status-like options
     try:
         selects = driver.find_elements(By.CSS_SELECTOR, "#reportFilter select")
         for sel in selects:
@@ -194,14 +211,13 @@ def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: s
                     select_obj = Select(sel)
                     select_obj.select_by_visible_text(listing_status)
                     results["status_set"] = True
-                    print(f"Set listing status to '{listing_status}' via select dropdown")
+                    log(f"Set listing status to '{listing_status}' via select dropdown")
                     break
             except Exception:
                 continue
     except Exception as e:
-        print(f"Strategy 1 (select) for status failed: {e}")
+        log(f"Select strategy for status failed: {e}")
 
-    # Strategy 2: Find checkboxes near status labels
     if not results["status_set"]:
         try:
             status_labels = driver.find_elements(
@@ -215,18 +231,17 @@ def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: s
                         cb.click()
                         time.sleep(0.3)
                     results["status_set"] = True
-                    print(f"Set listing status '{listing_status}' via checkbox")
+                    log(f"Set listing status '{listing_status}' via checkbox")
                     break
                 except Exception:
                     continue
         except Exception as e:
-            print(f"Strategy 2 (checkbox) for status failed: {e}")
+            log(f"Checkbox strategy for status failed: {e}")
 
     # ── Date Range ──
     days_map = {"24h": 1, "7d": 7, "14d": 14, "30d": 30}
     days = days_map.get(time_range, 7)
 
-    # Strategy 1: Look for "Days on Market" or "DOM" input
     try:
         dom_inputs = driver.find_elements(
             By.XPATH,
@@ -238,16 +253,14 @@ def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: s
             dom_inputs[0].clear()
             dom_inputs[0].send_keys(str(days))
             results["date_set"] = True
-            print(f"Set days on market to {days}")
+            log(f"Set days on market to {days}")
     except Exception as e:
-        print(f"Strategy 1 (DOM input) for date failed: {e}")
+        log(f"DOM input for date failed: {e}")
 
-    # Strategy 2: Look for date input fields and set a date range
     if not results["date_set"]:
         try:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
-
             date_inputs = driver.find_elements(
                 By.XPATH,
                 "//input[contains(@name, 'date') or contains(@name, 'Date') or "
@@ -259,11 +272,10 @@ def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: s
                 date_inputs[1].clear()
                 date_inputs[1].send_keys(end_date.strftime("%m/%d/%Y"))
                 results["date_set"] = True
-                print(f"Set date range: {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}")
+                log(f"Set date range: {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}")
         except Exception as e:
-            print(f"Strategy 2 (date inputs) for date failed: {e}")
+            log(f"Date inputs for date failed: {e}")
 
-    # Strategy 3: Look for a time range select
     if not results["date_set"]:
         try:
             selects = driver.find_elements(By.CSS_SELECTOR, "#reportFilter select")
@@ -273,7 +285,6 @@ def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: s
                     option_texts = [o.text.strip().lower() for o in options]
                     if any(kw in " ".join(option_texts) for kw in ["day", "week", "month", "hour"]):
                         select_obj = Select(sel)
-                        # Try to find an option matching our time range
                         target_texts = {
                             "24h": ["24 hours", "1 day", "last 24", "today"],
                             "7d": ["7 days", "1 week", "last 7", "last week"],
@@ -285,7 +296,7 @@ def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: s
                                 if target.lower() in option.text.strip().lower():
                                     select_obj.select_by_visible_text(option.text.strip())
                                     results["date_set"] = True
-                                    print(f"Set time range via select: {option.text.strip()}")
+                                    log(f"Set time range via select: {option.text.strip()}")
                                     break
                             if results["date_set"]:
                                 break
@@ -294,15 +305,13 @@ def try_set_filters(driver: webdriver.Chrome, listing_status: str, time_range: s
                 except Exception:
                     continue
         except Exception as e:
-            print(f"Strategy 3 (time select) for date failed: {e}")
+            log(f"Time select for date failed: {e}")
 
     return results
 
 
 def submit_search_form(driver: webdriver.Chrome):
     """Find and click the search/submit button on the Power Search form."""
-    wait = WebDriverWait(driver, 10)
-
     selectors = [
         (By.CSS_SELECTOR, "#reportFilter input[type='submit']"),
         (By.XPATH, "//input[@value='Search']"),
@@ -318,15 +327,14 @@ def submit_search_form(driver: webdriver.Chrome):
             btn = driver.find_element(selector_type, selector_value)
             if btn.is_displayed():
                 btn.click()
-                print(f"Clicked search button via: {selector_value}")
+                log(f"Clicked search button via: {selector_value}")
                 return True
         except Exception:
             continue
 
-    # Last resort: submit the form directly via JavaScript
     try:
         driver.execute_script("document.getElementById('reportFilter').submit()")
-        print("Submitted form via JavaScript")
+        log("Submitted form via JavaScript")
         return True
     except Exception:
         pass
@@ -335,53 +343,51 @@ def submit_search_form(driver: webdriver.Chrome):
 
 
 def run_power_search(driver: webdriver.Chrome, listing_status: str, time_range: str, max_pages: int) -> list:
-    """
-    Navigate to Power Search, set filters, run the search, and export results.
-    This replaces the old saved-search approach.
-    """
-    wait = WebDriverWait(driver, 20)
+    """Navigate to Power Search, set filters, run the search, and export results."""
+    wait = WebDriverWait(driver, 15)
 
-    # 1. Navigate to Power Search
     navigate_to_power_search(driver)
 
-    # 2. Try to set search filters
     filter_results = try_set_filters(driver, listing_status, time_range)
-    print(f"Filter results: {filter_results}")
+    log(f"Filter results: {filter_results}")
 
-    # 3. Submit the search
+    log("Submitting search...")
     submit_search_form(driver)
-    time.sleep(5)
+    time.sleep(3)
 
-    # 4. Wait for results table
+    log("Waiting for results table...")
     try:
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
+        log("Results table found")
     except TimeoutException:
-        # Check if there's a "no results" message
         page_text = driver.page_source.lower()
         if "no results" in page_text or "no records" in page_text or "no listings" in page_text:
-            print("Search returned no results")
+            log("Search returned no results")
             return []
+        # Save page source for debugging
+        log(f"No results table found. Page title: {driver.title}")
         raise Exception("Timed out waiting for search results table")
 
-    # 5. Export all pages
     export_folder = tempfile.mkdtemp(prefix="scraper-exports-")
     csv_files = export_all_pages_selenium(driver, export_folder, max_pages)
     df = merge_csvs(csv_files)
     shutil.rmtree(export_folder, ignore_errors=True)
 
-    return df.to_dict(orient="records") if not df.empty else []
+    listings = df.to_dict(orient="records") if not df.empty else []
+    log(f"Power search complete: {len(listings)} listings from {len(csv_files)} pages")
+    return listings
 
 
 def export_all_pages_selenium(driver, export_folder, max_pages):
     """Export CSV from each page via Selenium."""
-    wait = WebDriverWait(driver, 30)
+    wait = WebDriverWait(driver, 20)
     current_page = 1
     csv_files = []
 
     def list_downloads():
         return [os.path.join(export_folder, f) for f in os.listdir(export_folder)]
 
-    def wait_for_download(before_set, timeout=90):
+    def wait_for_download(before_set, timeout=60):
         end = time.time() + timeout
         while time.time() < end:
             current = set(list_downloads())
@@ -395,13 +401,13 @@ def export_all_pages_selenium(driver, export_folder, max_pages):
             time.sleep(0.5)
         raise TimeoutException("Download timed out")
 
-    # Need to set download directory for Selenium
     driver.execute_cdp_cmd("Page.setDownloadBehavior", {
         "behavior": "allow",
         "downloadPath": export_folder,
     })
 
     while current_page <= max_pages:
+        log(f"Exporting page {current_page}...")
         try:
             export_link = wait.until(
                 EC.element_to_be_clickable(
@@ -409,7 +415,7 @@ def export_all_pages_selenium(driver, export_folder, max_pages):
                 )
             )
             export_link.click()
-            time.sleep(1.5)
+            time.sleep(1)
 
             before = set(list_downloads())
 
@@ -424,9 +430,10 @@ def export_all_pages_selenium(driver, export_folder, max_pages):
             new_path = os.path.join(export_folder, f"page_{current_page}.csv")
             shutil.move(downloaded_path, new_path)
             csv_files.append(new_path)
+            log(f"Page {current_page} exported successfully")
 
         except Exception as e:
-            print(f"Error exporting page {current_page}: {e}")
+            log(f"Error exporting page {current_page}: {e}")
             break
 
         if current_page < max_pages:
@@ -437,9 +444,10 @@ def export_all_pages_selenium(driver, export_folder, max_pages):
                     )
                 )
                 next_link.click()
-                time.sleep(5)
+                time.sleep(3)
                 current_page += 1
             except Exception:
+                log(f"No more pages after page {current_page}")
                 break
         else:
             break
@@ -466,29 +474,23 @@ def merge_csvs(csv_files: list) -> pd.DataFrame:
 # ─── Synchronous scrape logic (runs in thread pool) ──
 
 def _do_scrape(username: str, password: str, listing_status: str, time_range: str, max_pages: int) -> dict:
-    """Run the full scrape in a blocking thread with retry on Chrome crash."""
-    last_error = None
-    for attempt in range(2):
-        driver = None
-        temp_profile = None
-        try:
-            print(f"Scrape attempt {attempt + 1}/2")
-            driver, temp_profile = create_driver()
-            login_and_get_cookies(driver, username, password)
-            listings = run_power_search(driver, listing_status, time_range, max_pages)
-            return {
-                "listings": listings,
-                "total_count": len(listings),
-                "pages_scraped": max_pages,
-            }
-        except Exception as e:
-            last_error = e
-            print(f"Attempt {attempt + 1} failed: {e}")
-            if attempt == 0:
-                time.sleep(3)
-        finally:
-            cleanup_driver(driver, temp_profile)
-    raise last_error
+    """Run the full scrape in a blocking thread."""
+    driver = None
+    temp_profile = None
+    try:
+        log("Starting scrape...")
+        driver, temp_profile = create_driver()
+        log("Chrome launched successfully")
+        login_and_get_cookies(driver, username, password)
+        listings = run_power_search(driver, listing_status, time_range, max_pages)
+        return {
+            "listings": listings,
+            "total_count": len(listings),
+            "pages_scraped": max_pages,
+        }
+    finally:
+        cleanup_driver(driver, temp_profile)
+        log("Chrome cleaned up")
 
 
 def _do_test_login(username: str, password: str) -> dict:
@@ -507,34 +509,30 @@ def _do_test_login(username: str, password: str) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "listing-notifier-scraper", "version": "3.3.0"}
+    return {"status": "ok", "service": "listing-notifier-scraper", "version": "4.0.0"}
 
 
 @app.get("/debug")
 async def debug():
     """Check Chrome and ChromeDriver versions and test browser launch."""
     import subprocess
-    info = {"service_version": "3.3.0"}
+    info = {"service_version": "4.0.0"}
 
-    # Chrome version
     try:
         result = subprocess.run(["google-chrome", "--version"], capture_output=True, text=True, timeout=10)
         info["chrome_version"] = result.stdout.strip()
     except Exception as e:
         info["chrome_version_error"] = str(e)
 
-    # ChromeDriver version
     try:
         result = subprocess.run(["chromedriver", "--version"], capture_output=True, text=True, timeout=10)
         info["chromedriver_version"] = result.stdout.strip()
     except Exception as e:
         info["chromedriver_version"] = "Not installed (using SeleniumManager)"
 
-    # Try to start Chrome
     try:
         driver, temp_profile = create_driver()
         info["browser_launch"] = "success"
-        info["browser_name"] = driver.capabilities.get("browserName", "unknown")
         info["browser_version"] = driver.capabilities.get("browserVersion", "unknown")
         info["chromedriver_actual"] = driver.capabilities.get("chrome", {}).get("chromedriverVersion", "unknown")
         cleanup_driver(driver, temp_profile)
